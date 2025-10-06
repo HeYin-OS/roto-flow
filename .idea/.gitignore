@@ -1,0 +1,16 @@
+# 默认忽略的文件
+/shelf/
+/workspace.xml
+# 基于编辑器的 HTTP 客户端请求
+/httpRequests/
+# Datasource local storage ignored files
+/dataSources/
+/dataSources.local.xml
+/vcs.xml
+.idea
+/modules.xml
+/codeStyles/codeStyleConfig.xml
+/misc.xml
+/roto-flow.iml
+/inspectionProfiles/profiles_settings.xml
+cache/

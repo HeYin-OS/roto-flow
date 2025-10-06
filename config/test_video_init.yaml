@@ -1,0 +1,4 @@
+video:
+  url_head: "./videos/soapbox/"
+  frame_num: 99
+  format: jpg

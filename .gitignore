@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Prerequisites
 *.d
 
@@ -39,3 +40,6 @@
 
 # debug information files
 *.dwo
+=======
+/caches/*
+>>>>>>> e3a37d0 (init commit)

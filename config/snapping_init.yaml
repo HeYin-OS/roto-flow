@@ -1,0 +1,10 @@
+snapping:
+  alpha: 0.1
+  beta: 0.5
+  sigma_c: 1.0
+  sigma_s: 1.6
+  sigma_m: 3.0
+  rho: 0.99
+  x: 4
+  y: 7
+  r_s: 7.5
