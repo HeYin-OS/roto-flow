@@ -5,6 +5,7 @@ from PySide6.QtGui import QPaintEvent, QPainter, QColor, QPen
 from PySide6.QtWidgets import QWidget
 import numpy as np
 
+from edge_snapping import local_snapping
 from video import Video
 
 class CanvasWidget(QWidget):
@@ -108,6 +109,10 @@ class CanvasWidget(QWidget):
         print(f"[Sketch] {len(self.curves_on_each_frame[self.index_current_frame])} curve(s) on Frame {self.index_current_frame}")
         # if len(self.curve_temp) == 0:
         #     print("Temporary curve is empty.")
+
+        # TODO: edge snapping curve here
+        for stroke in self.curves_on_each_frame[self.index_current_frame]:
+            local_snapping(stroke, self.test_video.tensor_format[self.index_current_frame])
 
         # other works
         self.reDraw()
