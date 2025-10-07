@@ -50,23 +50,22 @@ class EdgeSnappingConfig:
 
 
 # image [C, H, W]
-def local_snapping(stroke: List[QPoint], image_tensor: Tensor):
+def local_snapping(stroke: List[QPoint], image_tensor_rgb: Tensor):
     EdgeSnappingConfig.load('config/snapping_init.yaml')
 
     stroke_np_xy = np.array([[p.x(), p.y()] for p in stroke], dtype=np.float32)
-    image_np = (image_tensor.permute(1, 2, 0).data.cpu().numpy() * 255).astype(np.uint8)
+    image_np_rgb = (image_tensor_rgb.permute(1, 2, 0).data.cpu().numpy() * 255).astype(np.uint8)
+    image_np_gray = cv2.cvtColor(image_np_rgb, cv2.COLOR_RGB2GRAY)
 
-    candidate_points = compute_candidates(image_np)
+    candidate_points = compute_candidates(image_np_gray)
 
-    weights = compute_weights(stroke_np_xy, image_np, candidate_points)
+    compute_weights(stroke_np_xy, image_np_gray, candidate_points)
 
 
-def compute_candidates(image_np: np.ndarray[Any, np.dtype[Any]]):
-    image_gray_cv = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
-
+def compute_candidates(image_np_gray: np.ndarray[Any, np.dtype[Any]]):
     # gradient magnitude
-    gx = cv2.Sobel(image_gray_cv, cv2.CV_32F, 1, 0, ksize=3, borderType=cv2.BORDER_DEFAULT)
-    gy = cv2.Sobel(image_gray_cv, cv2.CV_32F, 0, 1, ksize=3, borderType=cv2.BORDER_DEFAULT)
+    gx = cv2.Sobel(image_np_gray, cv2.CV_32F, 1, 0, ksize=3, borderType=cv2.BORDER_DEFAULT)
+    gy = cv2.Sobel(image_np_gray, cv2.CV_32F, 0, 1, ksize=3, borderType=cv2.BORDER_DEFAULT)
     mag = cv2.magnitude(gx, gy)
 
     # normalization
@@ -80,7 +79,7 @@ def compute_candidates(image_np: np.ndarray[Any, np.dtype[Any]]):
     # local maximum
     local_max = (mag_norm > nbr_max) & (mag_norm >= float(EdgeSnappingConfig.theta))
 
-    cv2.imshow('local_max', local_max.astype(np.uint8) * 255)
+    # cv2.imshow('local_max', local_max.astype(np.uint8) * 255)
 
     # all candidate points on this frame
     ys, xs = np.nonzero(local_max)
@@ -88,14 +87,15 @@ def compute_candidates(image_np: np.ndarray[Any, np.dtype[Any]]):
 
 
 def compute_weights(stroke_xy: np.ndarray,
-                    image: np.ndarray,
+                    image_np_gray: np.ndarray,
                     candidate_points:
                     np.ndarray):
-    m, u, v, M, M_inv = stroke_to_affine(stroke_xy)
+    M_inv = stroke_to_inverse_affine(stroke_xy)
+    image_np_wrapped = batch_wrap_with_inverse_affine(image_np_gray, M_inv)
+    # cv2.imshow('image_np_wrapped', image_np_wrapped[0].astype(np.uint8) * 255)
 
 
-
-def stroke_to_affine(stroke_xy: np.ndarray, eps: float = 1e-6):
+def stroke_to_inverse_affine(stroke_xy: np.ndarray, eps: float = 1e-6):
     # first point and second point
     q0 = stroke_xy[:-1]
     q1 = stroke_xy[1:]
@@ -104,13 +104,11 @@ def stroke_to_affine(stroke_xy: np.ndarray, eps: float = 1e-6):
     m = 0.5 * (q0 + q1)
 
     # directional vector
-    d = (q1 - q0).astype(np.float32) # [N-1, 2]
+    d = (q1 - q0).astype(np.float32)  # [N-1, 2]
 
     # construct v
-    L = np.linalg.norm(d, axis=1, keepdims=True) # [N-1, 1]
-    mask = L > eps # [N-1, 1], filters L > eps for all dim=0
-    v = np.zeros_like(d) # [N-1, 2]
-    v[mask[:, 0]] = d[mask[:, 0]] / L[mask] # mask[:, 0] makes sure only vectors whose L > eps will be normalized
+    L = np.linalg.norm(d, axis=1, keepdims=True)  # [N-1, 1]
+    v = np.divide(d, L, out=np.zeros_like(d), where=L > eps)
 
     # construct u
     u = np.empty_like(v)
@@ -118,11 +116,13 @@ def stroke_to_affine(stroke_xy: np.ndarray, eps: float = 1e-6):
     u[:, 1] = v[:, 0]
 
     # construct affine matrix
+
     #                             stack along new axis = 2
     #                             ----------------------->
     #                             [u0 v0]
     # makes [u0, u1], [v0, v1] to [u1 v1]
     A = np.stack([u, v], axis=2)
+
     #             [u0 v0]      [m0]    [u0 v0 m0]
     # concatenate [u1 v1] with [m1] to [u1 v1 m1], None means new axis with dim=1
     M = np.concatenate([A, m[:, :, None]], axis=2)
@@ -130,12 +130,31 @@ def stroke_to_affine(stroke_xy: np.ndarray, eps: float = 1e-6):
     # inverse affine matrix
     # transpose axis=1 and axis=2
     A_T = np.transpose(A, (0, 2, 1))
+
     # new_p = M @ p + m
     # -----> M @ p = new_p - m
     # -----> p = inv(M) @ new_p - inv(M) @ m
-    # --- ( let t_inv = - inv(M) @ m ) --> p = inv(M) @ new_p + t_inv
+    # let "t_inv" be "- inv(M) @ m"
+    # -----> p = inv(M) @ new_p + t_inv
     t_inv = -(A_T @ m[:, :, None])
     M_inv = np.concatenate([A_T, t_inv], axis=2)
 
-    return m, u, v, M, M_inv
+    return M_inv
 
+
+def batch_wrap_with_inverse_affine(image_np_gray: np.ndarray, M_inv: np.ndarray):
+    M_inv = M_inv.astype(np.float32)
+    H, W = image_np_gray.shape[:2]
+
+    out = []
+    for i in range(M_inv.shape[0]):
+        wrapped = cv2.warpAffine(
+            image_np_gray,
+            M_inv[i],
+            dsize=(W, H),
+            flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0
+        )
+        out.append(wrapped)
+    return np.stack(out, axis=0)
