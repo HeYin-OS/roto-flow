@@ -23,6 +23,9 @@ class EdgeSnappingConfig:
     candidate_num = None
     sampling_num = None
 
+    fdog_kernel = None
+    gaussian_kernel = None
+
     isConfigInit: bool = False
 
     @staticmethod
@@ -47,6 +50,19 @@ class EdgeSnappingConfig:
         EdgeSnappingConfig.sampling_num = s['sampling_num']
 
         EdgeSnappingConfig.isConfigInit = True
+
+        EdgeSnappingConfig.fdog_kernel = create_fdog_kernel(
+            2 * EdgeSnappingConfig.X_MAX + 1,
+            EdgeSnappingConfig.sigma_c,
+            EdgeSnappingConfig.sigma_s,
+            EdgeSnappingConfig.rho,
+            1
+        )
+        EdgeSnappingConfig.gaussian_kernel = create_gaussian_kernel(
+            2 * EdgeSnappingConfig.Y_MAX + 1,
+            EdgeSnappingConfig.sigma_m,
+            0
+        )
 
 
 # image [C, H, W]
@@ -90,13 +106,27 @@ def compute_weights(stroke_xy: np.ndarray,
                     image_np_gray: np.ndarray,
                     candidate_points:
                     np.ndarray):
-    M_inv = stroke_to_inverse_affine(stroke_xy)
-    image_np_wrapped = batch_wrap_with_inverse_affine(image_np_gray, M_inv)
-    # cv2.imshow('image_np_wrapped', image_np_wrapped[0].astype(np.uint8) * 255)
+    affine = batch_stroke_to_affine(stroke_xy)
+
+    # do padding on image to make it ready for convolution
+    # image_np_gray_padded = np.pad(image_np_gray,
+    #                               ((EdgeSnappingConfig.Y_MAX, EdgeSnappingConfig.Y_MAX),
+    #                                (EdgeSnappingConfig.X_MAX, EdgeSnappingConfig.X_MAX)),
+    #                               mode='constant',
+    #                               constant_values=0)
+    image_np_trimmed = batch_wrap_with_affine_and_trim(image_np_gray, affine)
+    # cv2.imshow('image_np_wrapped', image_np_trimmed[0].astype(np.uint8) * 255)
+
+    temp = np.tensordot(image_np_trimmed,
+                        EdgeSnappingConfig.fdog_kernel,
+                        axes=([-1], [-1]))
+    H = np.tensordot(temp,
+                     EdgeSnappingConfig.gaussian_kernel,
+                     axes=([1], [0])).squeeze()
+    tilde_H = np.where(H < 0, 1.0 + np.tanh(H), 1.0)
 
 
-def stroke_to_inverse_affine(stroke_xy: np.ndarray, eps: float = 1e-6):
-    # first point and second point
+def batch_stroke_to_affine(stroke_xy: np.ndarray, eps: float = 1e-6):
     q0 = stroke_xy[:-1]
     q1 = stroke_xy[1:]
 
@@ -115,6 +145,10 @@ def stroke_to_inverse_affine(stroke_xy: np.ndarray, eps: float = 1e-6):
     u[:, 0] = -v[:, 1]
     u[:, 1] = v[:, 0]
 
+    X = EdgeSnappingConfig.X_MAX
+    Y = EdgeSnappingConfig.Y_MAX
+    t = m - X * u - Y * v
+
     # construct affine matrix
 
     #                             stack along new axis = 2
@@ -125,36 +159,54 @@ def stroke_to_inverse_affine(stroke_xy: np.ndarray, eps: float = 1e-6):
 
     #             [u0 v0]      [m0]    [u0 v0 m0]
     # concatenate [u1 v1] with [m1] to [u1 v1 m1], None means new axis with dim=1
-    M = np.concatenate([A, m[:, :, None]], axis=2)
+    M = np.concatenate([A, t[:, :, None]], axis=2)
+    #
+    # # inverse affine matrix
+    # # transpose axis=1 and axis=2
+    # A_T = np.transpose(A, (0, 2, 1))
+    #
+    # # new_p = M @ p + m
+    # # -----> M @ p = new_p - m
+    # # -----> p = inv(M) @ new_p - inv(M) @ m
+    # # let "t_inv" be "- inv(M) @ m"
+    # # -----> p = inv(M) @ new_p + t_inv
+    # t_inv = -(A_T @ m[:, :, None])
+    # M_inv = np.concatenate([A_T, t_inv], axis=2)
 
-    # inverse affine matrix
-    # transpose axis=1 and axis=2
-    A_T = np.transpose(A, (0, 2, 1))
-
-    # new_p = M @ p + m
-    # -----> M @ p = new_p - m
-    # -----> p = inv(M) @ new_p - inv(M) @ m
-    # let "t_inv" be "- inv(M) @ m"
-    # -----> p = inv(M) @ new_p + t_inv
-    t_inv = -(A_T @ m[:, :, None])
-    M_inv = np.concatenate([A_T, t_inv], axis=2)
-
-    return M_inv
+    return M
 
 
-def batch_wrap_with_inverse_affine(image_np_gray: np.ndarray, M_inv: np.ndarray):
-    M_inv = M_inv.astype(np.float32)
-    H, W = image_np_gray.shape[:2]
+def batch_wrap_with_affine_and_trim(image_np_gray: np.ndarray, M_fwd: np.ndarray):
+    M_fwd = M_fwd.astype(np.float32)
+    Hwin, Wwin = 2 * EdgeSnappingConfig.Y_MAX + 1, 2 * EdgeSnappingConfig.X_MAX + 1
+
 
     out = []
-    for i in range(M_inv.shape[0]):
+    for i in range(M_fwd.shape[0]):
         wrapped = cv2.warpAffine(
             image_np_gray,
-            M_inv[i],
-            dsize=(W, H),
+            M_fwd[i],
+            dsize=(Wwin, Hwin),
             flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=0
         )
         out.append(wrapped)
-    return np.stack(out, axis=0)
+    image_np_affine = np.stack(out, axis=0)
+    return image_np_affine#[:, :2 * EdgeSnappingConfig.Y_MAX + 1, :2 * EdgeSnappingConfig.X_MAX + 1]
+
+
+def create_gaussian_kernel(size, sigma, direction):
+    kernel = cv2.getGaussianKernel(size, sigma, cv2.CV_32F)
+    if direction == 0:
+        return kernel
+    elif direction == 1:
+        return kernel.T
+    return None
+
+
+def create_fdog_kernel(size, sigma_c, sigma_s, rho, direction):
+    kernel1 = create_gaussian_kernel(size, sigma_c, direction)
+    kernel2 = create_gaussian_kernel(size, sigma_s, direction)
+    dog_kernel = kernel1 - rho * kernel2
+    return dog_kernel
