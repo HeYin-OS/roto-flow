@@ -3,6 +3,8 @@ import os
 from PySide6.QtGui import QPixmap
 from tqdm import tqdm
 
+from edge_snapping import compute_candidates, EdgeSnappingConfig
+from kd_tree import RadiusNP
 from raft_predictor import RAFTPredictor
 from yaml_reader import YamlUtil
 from PIL import Image
@@ -15,6 +17,9 @@ class Video:
         self.frame_num: int = YamlUtil.read(yaml_url)['video']['frame_num']
         self.frame_format: str = YamlUtil.read(yaml_url)['video']['format']
 
+        # init snapping config
+        EdgeSnappingConfig.load(self.getFrameImagePath(), 'config/snapping_init.yaml')
+
         print(f"Reading video frames from designated URL: {self.url_head}*****.{self.frame_format} ({self.frame_num} frames)...")
         self.tensor_format = self.loadFrameSequenceTensor()
         print(f"✓ Pre-loaded frames as tensor, shape: {self.tensor_format.shape}")
@@ -22,6 +27,9 @@ class Video:
         print(f"✓ Pre-loaded frames as QPixmap, size: {len(self.qPixmap_format)}")
         self.optical_flow_cache = self.makeOpticalFlowCache()
         print(f"✓ Pre-computed Optical Flow Cache, shape: {len(self.optical_flow_cache.shape)}")
+        candidate_on_each_frame = compute_candidates(self.tensor_format)
+        self.candidate_trees = RadiusNP(candidate_on_each_frame)
+        print(f"✓ Cached candidate points on all frames, shape: {len(candidate_on_each_frame)} of {type(candidate_on_each_frame[0])}")
 
         self.channel: int = self.tensor_format.shape[1]
         self.height: int = self.tensor_format.shape[2]
@@ -70,3 +78,6 @@ class Video:
         print(f"✓ Saved optical flow cache to: {cache_rul}")
 
         return result
+
+    def getFrameImagePath(self):
+        return f"{self.url_head}{0:05d}.{self.frame_format}"

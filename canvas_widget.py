@@ -5,8 +5,9 @@ from PySide6.QtGui import QPaintEvent, QPainter, QColor, QPen
 from PySide6.QtWidgets import QWidget
 import numpy as np
 
-from edge_snapping import local_snapping
+from edge_snapping import local_snapping, EdgeSnappingConfig
 from video import Video
+
 
 class CanvasWidget(QWidget):
     def __init__(self, parent):
@@ -31,9 +32,9 @@ class CanvasWidget(QWidget):
         # indicator for drawing order on current frame
         self.index_drawing_order_on_each_frame = np.zeros(self.test_video.frame_num, dtype=int)
 
-        # storage for curves (Div1: frame num<list>, Div2: Drawing order<list>, Div3: Point idx<idx>, Div4: QPointF)
+        # storage for curves (Div1: frame idx<list>, Div2: drawing idx<list>, Div3: point idx<list>, Div4: QPoint)
         self.curves_on_each_frame: List[List[List[QPoint]]] = [[] for _ in range(self.test_video.frame_num)]
-        self.curve_temp:List[QPoint] = []
+        self.curve_temp: List[QPoint] = []
 
         # TODO: Other variables for future implementation of bezier curve
 
@@ -54,7 +55,7 @@ class CanvasWidget(QWidget):
         pen = QPen()
         pen.setColor(QColor(0, 0, 0))
         pen.setWidth(3)
-        painter.setPen(pen) # black
+        painter.setPen(pen)  # black
 
         for curve in self.curves_on_each_frame[self.index_current_frame]:
             painter.drawPolyline(curve)
@@ -101,9 +102,8 @@ class CanvasWidget(QWidget):
         self.is_mouse_pressed = False
 
         # move temp curve to curves
+        self.reDraw()
         print(f"\n[Sketch] Drawing Info of Latest Curve: Total {len(self.curve_temp)} Point(s)")
-        self.curves_on_each_frame[self.index_current_frame].append(self.curve_temp)
-        self.curve_temp = []
 
         # debug
         print(f"[Sketch] {len(self.curves_on_each_frame[self.index_current_frame])} curve(s) on Frame {self.index_current_frame}")
@@ -111,8 +111,20 @@ class CanvasWidget(QWidget):
         #     print("Temporary curve is empty.")
 
         # TODO: edge snapping curve here
-        for stroke in self.curves_on_each_frame[self.index_current_frame]:
-            local_snapping(stroke, self.test_video.tensor_format[self.index_current_frame])
+
+        # TODO: quick point query
+        # only current curve needs to be done local snapping
+        current_stroke_np_xy = np.array([[p.x(), p.y()] for p in self.curve_temp], dtype=np.float32)
+        temp = self.test_video.candidate_trees.query_batch(
+            self.index_current_frame,
+            current_stroke_np_xy,
+            EdgeSnappingConfig.r_s
+        )
+        # TODO: complete weight computation
+        # local_snapping(current_stroke_np_xy, self.test_video.tensor_format[self.index_current_frame])
+
+        self.curves_on_each_frame[self.index_current_frame].append(self.curve_temp)
+        self.curve_temp = []
 
         # other works
         self.reDraw()

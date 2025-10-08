@@ -3,11 +3,23 @@ from typing import List, Any
 
 import cv2
 import numpy as np
+from PIL import Image
 from PySide6.QtCore import QPoint
 from torch import Tensor
 
 from yaml_reader import YamlUtil
 
+def getDpi(imgUrl):
+    img = Image.open(imgUrl)
+    dpi = img.info.get('dpi', (96, 96))
+    return dpi
+
+
+def mm_to_pixels(mm, imgUrl):
+    inches = mm / 25.4
+    dpi = getDpi(imgUrl)
+    pixel_length = dpi[0] * inches
+    return pixel_length
 
 class EdgeSnappingConfig:
     theta = None
@@ -26,10 +38,12 @@ class EdgeSnappingConfig:
     fdog_kernel = None
     gaussian_kernel = None
 
+
+
     isConfigInit: bool = False
 
     @staticmethod
-    def load(config_yaml_path='config/snapping_init.yaml'):
+    def load(frame_path, config_yaml_path='config/snapping_init.yaml'):
         if EdgeSnappingConfig.isConfigInit:
             return
 
@@ -45,7 +59,7 @@ class EdgeSnappingConfig:
         EdgeSnappingConfig.rho = s['rho']
         EdgeSnappingConfig.X_MAX = s['x']
         EdgeSnappingConfig.Y_MAX = s['y']
-        EdgeSnappingConfig.r_s = s['r_s']
+        EdgeSnappingConfig.r_s = mm_to_pixels(s['r_s'], frame_path)
         EdgeSnappingConfig.candidate_num = s['candidate_num']
         EdgeSnappingConfig.sampling_num = s['sampling_num']
 
@@ -66,40 +80,43 @@ class EdgeSnappingConfig:
 
 
 # image [C, H, W]
-def local_snapping(stroke: List[QPoint], image_tensor_rgb: Tensor):
-    EdgeSnappingConfig.load('config/snapping_init.yaml')
+def local_snapping(stroke: np.ndarray, image_tensor_rgb: Tensor):
 
     stroke_np_xy = np.array([[p.x(), p.y()] for p in stroke], dtype=np.float32)
-    image_np_rgb = (image_tensor_rgb.permute(1, 2, 0).data.cpu().numpy() * 255).astype(np.uint8)
-    image_np_gray = cv2.cvtColor(image_np_rgb, cv2.COLOR_RGB2GRAY)
 
-    candidate_points = compute_candidates(image_np_gray)
+    # candidate_points = compute_candidates(image_np_gray)
 
-    compute_weights(stroke_np_xy, image_np_gray, candidate_points)
+    # compute_weights(stroke_np_xy, image_np_gray, candidate_points)
 
 
-def compute_candidates(image_np_gray: np.ndarray[Any, np.dtype[Any]]):
-    # gradient magnitude
-    gx = cv2.Sobel(image_np_gray, cv2.CV_32F, 1, 0, ksize=3, borderType=cv2.BORDER_DEFAULT)
-    gy = cv2.Sobel(image_np_gray, cv2.CV_32F, 0, 1, ksize=3, borderType=cv2.BORDER_DEFAULT)
-    mag = cv2.magnitude(gx, gy)
+def compute_candidates(frames_tensor_rgb: Tensor):
+    out = []
+    for frame_tensor_rgb in frames_tensor_rgb:
+        image_np_rgb = (frame_tensor_rgb.permute(1, 2, 0).data.cpu().numpy() * 255).astype(np.uint8)
+        image_np_gray = cv2.cvtColor(image_np_rgb, cv2.COLOR_RGB2GRAY)
 
-    # normalization
-    mag_norm = cv2.normalize(mag, None, 0, 1, cv2.NORM_MINMAX, dtype=cv2.CV_32F)
+        # gradient magnitude
+        gx = cv2.Sobel(image_np_gray, cv2.CV_32F, 1, 0, ksize=3, borderType=cv2.BORDER_DEFAULT)
+        gy = cv2.Sobel(image_np_gray, cv2.CV_32F, 0, 1, ksize=3, borderType=cv2.BORDER_DEFAULT)
+        mag = cv2.magnitude(gx, gy)
 
-    # neighbor max in 3*3 window
-    k = np.ones((3, 3), np.uint8)
-    k[1, 1] = 0
-    nbr_max = cv2.dilate(mag_norm, k)
+        # normalization
+        mag_norm = cv2.normalize(mag, None, 0, 1, cv2.NORM_MINMAX, dtype=cv2.CV_32F)
 
-    # local maximum
-    local_max = (mag_norm > nbr_max) & (mag_norm >= float(EdgeSnappingConfig.theta))
+        # neighbor max in 3*3 window
+        k = np.ones((3, 3), np.uint8)
+        k[1, 1] = 0
+        nbr_max = cv2.dilate(mag_norm, k)
 
-    # cv2.imshow('local_max', local_max.astype(np.uint8) * 255)
+        # local maximum
+        local_max = (mag_norm > nbr_max) & (mag_norm >= float(EdgeSnappingConfig.theta))
 
-    # all candidate points on this frame
-    ys, xs = np.nonzero(local_max)
-    return np.stack([ys, xs], axis=1)
+        # cv2.imshow('local_max', local_max.astype(np.uint8) * 255)
+
+        # all candidate points on this frame
+        ys, xs = np.nonzero(local_max)
+        out.append(np.stack([ys, xs], axis=1))
+    return out
 
 
 def compute_weights(stroke_xy: np.ndarray,

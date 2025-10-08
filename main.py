@@ -1,6 +1,7 @@
 import sys, torch, torchvision
 from PySide6.QtWidgets import QApplication
 
+from edge_snapping import EdgeSnappingConfig
 from main_window import MainWindow
 
 def print_separator(title):
@@ -30,9 +31,9 @@ def test_cuda_availability():
         print("CUDA unavailable，turn to use of CPU")
 
 def main():
-    test_basic_info()
-
-    test_cuda_availability()
+    # test_basic_info()
+    #
+    # test_cuda_availability()
 
     print_separator("Application Debug Info")
 
