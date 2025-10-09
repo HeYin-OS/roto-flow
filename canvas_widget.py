@@ -1,5 +1,6 @@
 from typing import List, Tuple
 
+import cv2
 from PySide6.QtCore import QPoint, Slot
 from PySide6.QtGui import QPaintEvent, QPainter, QColor, QPen
 from PySide6.QtWidgets import QWidget
@@ -100,31 +101,33 @@ class CanvasWidget(QWidget):
     def mouseReleaseEvent(self, event):
         # set to unpressed
         self.is_mouse_pressed = False
-
-        # move temp curve to curves
-        self.reDraw()
         print(f"\n[Sketch] Drawing Info of Latest Curve: Total {len(self.curve_temp)} Point(s)")
 
-        # debug
-        print(f"[Sketch] {len(self.curves_on_each_frame[self.index_current_frame])} curve(s) on Frame {self.index_current_frame}")
         # if len(self.curve_temp) == 0:
         #     print("Temporary curve is empty.")
 
         # TODO: edge snapping curve here
-
-        # TODO: quick point query
         # only current curve needs to be done local snapping
-        current_stroke_np_xy = np.array([[p.x(), p.y()] for p in self.curve_temp], dtype=np.float32)
-        temp = self.test_video.candidate_trees.query_batch(
-            self.index_current_frame,
-            current_stroke_np_xy,
-            EdgeSnappingConfig.r_s
+        current_stroke_np_yx = np.array([[p.y(), p.x()] for p in self.curve_temp], dtype=np.float32)
+        stroke_point_idx_to_candidates = self.test_video.candidate_kd_trees.query_batch(
+            frame_idx=self.index_current_frame,
+            centers_yx=current_stroke_np_yx,
+            radius=EdgeSnappingConfig.r_s
         )
-        # TODO: complete weight computation
-        # local_snapping(current_stroke_np_xy, self.test_video.tensor_format[self.index_current_frame])
+        local_snapping(stroke_np_yx=current_stroke_np_yx,
+                       image_tensor_rgb=self.test_video.tensor_format[self.index_current_frame],
+                       stroke_point_idx_to_candidates=stroke_point_idx_to_candidates)
+        # test_image = np.zeros_like(cv2.imread("videos/soapbox/00000.jpg", flags=cv2.IMREAD_GRAYSCALE), dtype=np.uint8)
+        # for candidate_group in stroke_point_idx_to_candidates:
+        #     for (y, x) in candidate_group:
+        #         test_image[int(y), int(x)] = 255
+        # cv2.imshow("test_image", test_image)
 
+        # move temp curve to curves
         self.curves_on_each_frame[self.index_current_frame].append(self.curve_temp)
         self.curve_temp = []
+        # debug
+        print(f"[Sketch] {len(self.curves_on_each_frame[self.index_current_frame])} curve(s) on Frame {self.index_current_frame}")
 
         # other works
         self.reDraw()

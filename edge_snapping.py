@@ -9,6 +9,7 @@ from torch import Tensor
 
 from yaml_reader import YamlUtil
 
+
 def getDpi(imgUrl):
     img = Image.open(imgUrl)
     dpi = img.info.get('dpi', (96, 96))
@@ -20,6 +21,7 @@ def mm_to_pixels(mm, imgUrl):
     dpi = getDpi(imgUrl)
     pixel_length = dpi[0] * inches
     return pixel_length
+
 
 class EdgeSnappingConfig:
     theta = None
@@ -37,8 +39,6 @@ class EdgeSnappingConfig:
 
     fdog_kernel = None
     gaussian_kernel = None
-
-
 
     isConfigInit: bool = False
 
@@ -80,18 +80,17 @@ class EdgeSnappingConfig:
 
 
 # image [C, H, W]
-def local_snapping(stroke: np.ndarray, image_tensor_rgb: Tensor):
+def local_snapping(stroke_np_yx: np.ndarray, image_tensor_rgb: Tensor, stroke_point_idx_to_candidates: List[np.ndarray]):
+    image_np_rgb = (image_tensor_rgb.permute(1, 2, 0).data.cpu().numpy() * 255).astype(np.uint8)
+    image_np_gray = cv2.cvtColor(image_np_rgb, cv2.COLOR_RGB2GRAY)
+    compute_weights(stroke_np_yx, image_np_gray, stroke_point_idx_to_candidates)
 
-    stroke_np_xy = np.array([[p.x(), p.y()] for p in stroke], dtype=np.float32)
-
-    # candidate_points = compute_candidates(image_np_gray)
-
-    # compute_weights(stroke_np_xy, image_np_gray, candidate_points)
+    # TODO: complete weight computation
 
 
 def compute_candidates(frames_tensor_rgb: Tensor):
     out = []
-    for frame_tensor_rgb in frames_tensor_rgb:
+    for i, frame_tensor_rgb in enumerate(frames_tensor_rgb):
         image_np_rgb = (frame_tensor_rgb.permute(1, 2, 0).data.cpu().numpy() * 255).astype(np.uint8)
         image_np_gray = cv2.cvtColor(image_np_rgb, cv2.COLOR_RGB2GRAY)
 
@@ -111,7 +110,7 @@ def compute_candidates(frames_tensor_rgb: Tensor):
         # local maximum
         local_max = (mag_norm > nbr_max) & (mag_norm >= float(EdgeSnappingConfig.theta))
 
-        # cv2.imshow('local_max', local_max.astype(np.uint8) * 255)
+        # if i == 0: cv2.imshow('local_max', local_max.astype(np.uint8) * 255)
 
         # all candidate points on this frame
         ys, xs = np.nonzero(local_max)
@@ -119,11 +118,10 @@ def compute_candidates(frames_tensor_rgb: Tensor):
     return out
 
 
-def compute_weights(stroke_xy: np.ndarray,
+def compute_weights(stroke_np_yx: np.ndarray,
                     image_np_gray: np.ndarray,
-                    candidate_points:
-                    np.ndarray):
-    affine = batch_stroke_to_affine(stroke_xy)
+                    candidate_points: List[np.ndarray]):
+    affine = batch_stroke_to_affine(stroke_np_yx)
 
     # do padding on image to make it ready for convolution
     # image_np_gray_padded = np.pad(image_np_gray,
@@ -132,7 +130,7 @@ def compute_weights(stroke_xy: np.ndarray,
     #                               mode='constant',
     #                               constant_values=0)
     image_np_trimmed = batch_wrap_with_affine_and_trim(image_np_gray, affine)
-    # cv2.imshow('image_np_wrapped', image_np_trimmed[0].astype(np.uint8) * 255)
+    cv2.imshow('image_np_wrapped', image_np_trimmed[0].astype(np.uint8) * 255)
 
     temp = np.tensordot(image_np_trimmed,
                         EdgeSnappingConfig.fdog_kernel,
@@ -143,7 +141,8 @@ def compute_weights(stroke_xy: np.ndarray,
     tilde_H = np.where(H < 0, 1.0 + np.tanh(H), 1.0)
 
 
-def batch_stroke_to_affine(stroke_xy: np.ndarray, eps: float = 1e-6):
+def batch_stroke_to_affine(stroke_yx: np.ndarray, eps: float = 1e-6):
+    stroke_xy = stroke_yx[:, [1, 0]]
     q0 = stroke_xy[:-1]
     q1 = stroke_xy[1:]
 
@@ -170,10 +169,12 @@ def batch_stroke_to_affine(stroke_xy: np.ndarray, eps: float = 1e-6):
 
     #                             stack along new axis = 2
     #                             ----------------------->
-    #                             [u0 v0]
-    # makes [u0, u1], [v0, v1] to [u1 v1]
+    # makes [u0, u1], [v0, v1] to [u0 v0]
+    #                             [u1 v1]
     A = np.stack([u, v], axis=2)
 
+    #                                  concatenate along existed axis = 2
+    #                                  ----------------------->
     #             [u0 v0]      [m0]    [u0 v0 m0]
     # concatenate [u1 v1] with [m1] to [u1 v1 m1], None means new axis with dim=1
     M = np.concatenate([A, t[:, :, None]], axis=2)
@@ -193,16 +194,15 @@ def batch_stroke_to_affine(stroke_xy: np.ndarray, eps: float = 1e-6):
     return M
 
 
-def batch_wrap_with_affine_and_trim(image_np_gray: np.ndarray, M_fwd: np.ndarray):
-    M_fwd = M_fwd.astype(np.float32)
+def batch_wrap_with_affine_and_trim(image_np_gray: np.ndarray, M_affines: np.ndarray):
+    M_affines = M_affines.astype(np.float32)
     Hwin, Wwin = 2 * EdgeSnappingConfig.Y_MAX + 1, 2 * EdgeSnappingConfig.X_MAX + 1
 
-
     out = []
-    for i in range(M_fwd.shape[0]):
+    for i in range(M_affines.shape[0]):
         wrapped = cv2.warpAffine(
             image_np_gray,
-            M_fwd[i],
+            M_affines[i],
             dsize=(Wwin, Hwin),
             flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
             borderMode=cv2.BORDER_CONSTANT,
@@ -210,7 +210,7 @@ def batch_wrap_with_affine_and_trim(image_np_gray: np.ndarray, M_fwd: np.ndarray
         )
         out.append(wrapped)
     image_np_affine = np.stack(out, axis=0)
-    return image_np_affine#[:, :2 * EdgeSnappingConfig.Y_MAX + 1, :2 * EdgeSnappingConfig.X_MAX + 1]
+    return image_np_affine  # [:, :2 * EdgeSnappingConfig.Y_MAX + 1, :2 * EdgeSnappingConfig.X_MAX + 1]
 
 
 def create_gaussian_kernel(size, sigma, direction):

@@ -4,7 +4,7 @@ from PySide6.QtGui import QPixmap
 from tqdm import tqdm
 
 from edge_snapping import compute_candidates, EdgeSnappingConfig
-from kd_tree import RadiusNP
+from kd_tree import BatchKDTree
 from raft_predictor import RAFTPredictor
 from yaml_reader import YamlUtil
 from PIL import Image
@@ -28,7 +28,7 @@ class Video:
         self.optical_flow_cache = self.makeOpticalFlowCache()
         print(f"✓ Pre-computed Optical Flow Cache, shape: {len(self.optical_flow_cache.shape)}")
         candidate_on_each_frame = compute_candidates(self.tensor_format)
-        self.candidate_trees = RadiusNP(candidate_on_each_frame)
+        self.candidate_kd_trees = BatchKDTree(candidate_on_each_frame)
         print(f"✓ Cached candidate points on all frames, shape: {len(candidate_on_each_frame)} of {type(candidate_on_each_frame[0])}")
 
         self.channel: int = self.tensor_format.shape[1]
