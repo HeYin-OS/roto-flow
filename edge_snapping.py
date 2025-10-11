@@ -3,6 +3,7 @@ from typing import List, Any
 
 import cv2
 import numpy as np
+import torch
 from PIL import Image
 from PySide6.QtCore import QPoint
 from torch import Tensor
@@ -83,6 +84,7 @@ class EdgeSnappingConfig:
 def local_snapping(stroke_np_yx: np.ndarray, image_tensor_rgb: Tensor, stroke_point_idx_to_candidates: List[np.ndarray]):
     image_np_rgb = (image_tensor_rgb.permute(1, 2, 0).data.cpu().numpy() * 255).astype(np.uint8)
     image_np_gray = cv2.cvtColor(image_np_rgb, cv2.COLOR_RGB2GRAY)
+
     compute_weights(stroke_np_yx, image_np_gray, stroke_point_idx_to_candidates)
 
     # TODO: complete weight computation
@@ -121,45 +123,97 @@ def compute_candidates(frames_tensor_rgb: Tensor):
 def compute_weights(stroke_np_yx: np.ndarray,
                     image_np_gray: np.ndarray,
                     candidate_points: List[np.ndarray]):
-    affine = batch_stroke_to_affine(stroke_np_yx)
+    # convert np gray image [H, W] to tensor [B=1, C=1, H, W]
+    image_np_gray = image_np_gray.astype(np.float32) / 255.0
+    image_tensor_gray = torch.from_numpy(image_np_gray).unsqueeze(0).unsqueeze(0).cuda()
 
-    # do padding on image to make it ready for convolution
-    # image_np_gray_padded = np.pad(image_np_gray,
-    #                               ((EdgeSnappingConfig.Y_MAX, EdgeSnappingConfig.Y_MAX),
-    #                                (EdgeSnappingConfig.X_MAX, EdgeSnappingConfig.X_MAX)),
-    #                               mode='constant',
-    #                               constant_values=0)
-    image_np_trimmed = batch_wrap_with_affine_and_trim(image_np_gray, affine)
-    cv2.imshow('image_np_wrapped', image_np_trimmed[0].astype(np.uint8) * 255)
+    print(image_tensor_gray.shape)
 
-    temp = np.tensordot(image_np_trimmed,
-                        EdgeSnappingConfig.fdog_kernel,
-                        axes=([-1], [-1]))
-    H = np.tensordot(temp,
-                     EdgeSnappingConfig.gaussian_kernel,
-                     axes=([1], [0])).squeeze()
-    tilde_H = np.where(H < 0, 1.0 + np.tanh(H), 1.0)
+    # convert jagged array to flatten array with index pointer page
+    candidates_flatten_xy, flatten_index_ptr = pack_candidates_yx_to_integrity_xy(candidate_points)
+    candidate_len = flatten_index_ptr[-1]
+
+    # order to xy and get point number of stroke
+    stroke_len = stroke_np_yx.shape[0]
+    stroke_xy = stroke_np_yx[:, [1, 0]].astype(np.float32)
+
+    # ready for dp
+    # energy -> accumulated energy for each candidate point
+    # prev -> the best previous candidate point idx
+    energy = np.full(candidate_len, np.inf, dtype=np.float32)
+    prev = np.full(candidate_len, -1, dtype=np.float32)
+
+    # accumulated energy for first candidate group is zero
+    energy[flatten_index_ptr[0]: flatten_index_ptr[1]] = 0.0
+
+    for i in range(stroke_len - 1):
+        # candidate point groups of current stroke point index
+        Ui = slice(flatten_index_ptr[i], flatten_index_ptr[i + 1])
+        Uj = slice(flatten_index_ptr[i + 1], flatten_index_ptr[i + 2])
+        Qi = candidates_flatten_xy[Ui]
+        Qj = candidates_flatten_xy[Uj]
+
+        p_i, p_j = stroke_xy[i], stroke_xy[i + 1]
+
+        M_affine = batch_affine(Qi, Qj)  # shape: [K_{i}, K_{i+1}, 2, 3]
+
+        # TODO: use pytorch affine function for batch gpu image trimming
+
+    # temp = np.tensordot(image_np_trimmed,
+    #                     EdgeSnappingConfig.fdog_kernel,
+    #                     axes=([-1], [-1]))
+    # H = np.tensordot(temp,
+    #                  EdgeSnappingConfig.gaussian_kernel,
+    #                  axes=([1], [0])).squeeze()
+    # tilde_H = np.where(H < 0, 1.0 + np.tanh(H), 1.0)
 
 
-def batch_stroke_to_affine(stroke_yx: np.ndarray, eps: float = 1e-6):
-    stroke_xy = stroke_yx[:, [1, 0]]
-    q0 = stroke_xy[:-1]
-    q1 = stroke_xy[1:]
+# make jagged array to a integrated long array with index range pointer page
+def pack_candidates_yx_to_integrity_xy(candidate_points: List[np.ndarray]):
+    # total number of stroke points
+    stroke_points_num = len(candidate_points)
+
+    # index range pointer, index_ptr[i] means the start idx such that index_ptr[i+1] - index_ptr[i] means total number of current index
+    index_ptr = np.zeros(stroke_points_num + 1, dtype=np.int32)
+    for i in range(stroke_points_num):
+        index_ptr[i + 1] = index_ptr[i] + (0 if candidate_points[i] is None else len(candidate_points[i]))
+    candidates_total_num = index_ptr[-1]
+
+    # flatten candidate points array, dim 1: total candidate number, dim 2: x and y, meanwhile the order of yx is swapped to xy
+    candidates_flatten_xy = np.empty((candidates_total_num, 2), dtype=np.float32)
+    current_index = 0
+    for i in range(stroke_points_num):
+        candidate = candidate_points[i]
+        if candidate is None or len(candidate) == 0:
+            continue
+        # make sure it is in float format
+        candidate_float = candidate.astype(np.float32)
+        # build flatten array and do swapping
+        candidates_flatten_xy[current_index: current_index + len(candidate), 0] = candidate_float[:, 1]
+        candidates_flatten_xy[current_index: current_index + len(candidate), 1] = candidate_float[:, 0]
+        current_index += len(candidate)
+
+    return candidates_flatten_xy, index_ptr
+
+
+def batch_affine(Qi: np.ndarray, Qj: np.ndarray, eps: np.float32 = 1e-6):
+    # q0 = stroke_xy[:-1]
+    # q1 = stroke_xy[1:]
 
     # middle point
-    m = 0.5 * (q0 + q1)
+    m = np.float32(0.5) * (Qi[:, None, :] + Qj[None, :, :])
 
     # directional vector
-    d = (q1 - q0).astype(np.float32)  # [N-1, 2]
+    d = (Qj[None, :, :] - Qi[:, None, :]).astype(np.float32)
 
     # construct v
-    L = np.linalg.norm(d, axis=1, keepdims=True)  # [N-1, 1]
+    L = np.linalg.norm(d, axis=2, keepdims=True)
     v = np.divide(d, L, out=np.zeros_like(d), where=L > eps)
 
     # construct u
     u = np.empty_like(v)
-    u[:, 0] = -v[:, 1]
-    u[:, 1] = v[:, 0]
+    u[:, :, 0] = -v[:, :, 1]
+    u[:, :, 1] = v[:, :, 0]
 
     X = EdgeSnappingConfig.X_MAX
     Y = EdgeSnappingConfig.Y_MAX
@@ -167,17 +221,17 @@ def batch_stroke_to_affine(stroke_yx: np.ndarray, eps: float = 1e-6):
 
     # construct affine matrix
 
-    #                             stack along new axis = 2
+    #                             stack along new axis = 3
     #                             ----------------------->
     # makes [u0, u1], [v0, v1] to [u0 v0]
     #                             [u1 v1]
-    A = np.stack([u, v], axis=2)
+    A = np.stack([u, v], axis=3)
 
-    #                                  concatenate along existed axis = 2
+    #                                  concatenate along existed axis = 3
     #                                  ----------------------->
     #             [u0 v0]      [m0]    [u0 v0 m0]
-    # concatenate [u1 v1] with [m1] to [u1 v1 m1], None means new axis with dim=1
-    M = np.concatenate([A, t[:, :, None]], axis=2)
+    # concatenate [u1 v1] with [m1] to [u1 v1 m1]
+    M = np.concatenate([A, t[:, :, :, None]], axis=3)
     #
     # # inverse affine matrix
     # # transpose axis=1 and axis=2
