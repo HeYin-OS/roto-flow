@@ -37,6 +37,7 @@ def create_fdog_kernel(size, sigma_c, sigma_s, rho, direction):
     dog_kernel = kernel1 - rho * kernel2
     return dog_kernel
 
+
 def compute_candidates(frames_tensor_rgb: Tensor):
     out = []
     for i, frame_tensor_rgb in enumerate(frames_tensor_rgb):
@@ -135,11 +136,21 @@ def local_snapping(stroke_np_yx: np.ndarray, image_tensor_rgb: Tensor, stroke_po
 def compute_weights(stroke_np_yx: np.ndarray,
                     image_np_gray: np.ndarray,
                     candidate_points: List[np.ndarray]):
-    # convert np gray image [H, W] to tensor [B=1, C=1, H, W]
-    image_np_gray = image_np_gray.astype(np.float32) / 255.0
-    image_tensor_gray = torch.from_numpy(image_np_gray).unsqueeze(0).unsqueeze(0).cuda()
+    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    torch.backends.cudnn.benchmark = True
 
-    print(image_tensor_gray.shape)
+    # convert np gray image [H, W] to tensor [B=1, C=1, H, W]
+    H = image_np_gray.shape[0]
+    W = image_np_gray.shape[1]
+    image_np_gray = image_np_gray.astype(np.float32) / 255.0
+    image_tensor_gray_gpu = (
+        torch.from_numpy(image_np_gray)
+        .unsqueeze(0).unsqueeze(0)
+        .to(device, non_blocking=True)
+        .contiguous()
+    )   # shape: [1, 1, H, W]
+
+    print(image_tensor_gray_gpu.shape)
 
     # convert jagged array to flatten array with index pointer page
     candidates_flatten_xy, flatten_index_ptr = pack_candidates_yx_to_integrity_xy(candidate_points)
@@ -162,14 +173,31 @@ def compute_weights(stroke_np_yx: np.ndarray,
         # candidate point groups of current stroke point index
         Ui = slice(flatten_index_ptr[i], flatten_index_ptr[i + 1])
         Uj = slice(flatten_index_ptr[i + 1], flatten_index_ptr[i + 2])
-        Qi = candidates_flatten_xy[Ui]
-        Qj = candidates_flatten_xy[Uj]
+        Qi_xy = candidates_flatten_xy[Ui]
+        Qj_xy = candidates_flatten_xy[Uj]
 
         p_i, p_j = stroke_xy[i], stroke_xy[i + 1]
 
-        M_affine = batch_affine(Qi, Qj)  # shape: [K_{i}, K_{i+1}, 2, 3]
+        theta_flatten_gpu = batch_neighbor_candidates_to_reverse_affine(Qi_xy,
+                                                                        Qi_xy,
+                                                                        H, W).to(device)  # shape: [K_{i} * K_{i+1}, 2, 3]
 
-        # TODO: use pytorch affine function for batch gpu image trimming
+        grid_gpu = torch.nn.functional.affine_grid(
+            theta_flatten_gpu,
+            size=[theta_flatten_gpu.shape[0],
+                  1,
+                  2 * EdgeSnappingConfig.Y_MAX + 1,
+                  2 * EdgeSnappingConfig.X_MAX + 1],
+            align_corners=False
+        ).to(device)  # shape: [K_{i} * K_{i+1}, 2*Y+1, 2*X+1, 2]
+
+        image_affine_and_trimmed = torch.nn.functional.grid_sample(image_tensor_gray_gpu.expand(grid_gpu.shape[0], -1, -1, -1),
+                                                                   grid_gpu,
+                                                                   mode='bilinear',
+                                                                   padding_mode='zeros',
+                                                                   align_corners=False).to(device)
+
+        # TODO: compute weights based on trimmed image and do integral
 
     # temp = np.tensordot(image_np_trimmed,
     #                     EdgeSnappingConfig.fdog_kernel,
@@ -208,56 +236,106 @@ def pack_candidates_yx_to_integrity_xy(candidate_points: List[np.ndarray]):
     return candidates_flatten_xy, index_ptr
 
 
+def batch_neighbor_candidates_to_reverse_affine(Qi: np.ndarray,
+                                                Qj: np.ndarray,
+                                                H: int, W: int,
+                                                eps: np.float32 = 1e-6):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    Qi = torch.from_numpy(Qi.copy().astype(np.float32)).to(device)
+    Qj = torch.from_numpy(Qj.copy().astype(np.float32)).to(device)
+
+    len_i = Qj.shape[0]
+    len_j = Qi.shape[0]
+
+    m = 0.5 * (Qi[:, None, :] + Qj[None, :, :])  # [len_i, len_j, 2]
+    d = (Qj[None, :, :] - Qi[:, None, :])  # [len_i, len_j, 2]
+    L = torch.linalg.norm(d, dim=-1, keepdim=True)  # [len_i, len_j, 1]
+    v = d / L.clamp(min=eps)  # [len_i, len_j, 2]
+
+    u = torch.empty_like(v)  # [len_i, len_j, 2]
+    u[..., 0] = -v[..., 1]
+    u[..., 1] = v[..., 0]
+
+    X = float(EdgeSnappingConfig.X_MAX)
+    Y = float(EdgeSnappingConfig.Y_MAX)
+
+    # in sample grid, (x_norm. y_norm) means the center of a pixel
+    sx = 2.0 / W
+    sy = 2.0 / H
+    bx = 1.0 / W - 1.0
+    by = 1.0 / H - 1.0
+
+    # image coordinates to NDC
+    #                       [a00, a01, t0]
+    # target affine matrix: [a10, a11, t1] in NDC (for pytorch grid sampling)
+    a00 = sx * (X * u[..., 0])
+    a01 = sx * (Y * v[..., 0])
+    a10 = sy * (X * u[..., 1])
+    a11 = sy * (Y * v[..., 1])
+    t0 = sx * m[..., 0] + bx
+    t1 = sy * m[..., 1] + by
+
+    # build affine matrix - theta
+    theta = torch.stack([
+        torch.stack([a00, a01, t0], dim=-1),
+        torch.stack([a10, a11, t1], dim=-1)
+    ], dim=-2)  # [len_i, len_j, 2, 3]
+
+    theta_flat = theta.reshape(len_i * len_j, 2, 3).contiguous()  # [len_i * len_j, 2, 3]
+
+    return theta_flat
+
 # def batch_affine(Qi: np.ndarray, Qj: np.ndarray, eps: np.float32 = 1e-6):
-    # q0 = stroke_xy[:-1]
-    # q1 = stroke_xy[1:]
+# q0 = stroke_xy[:-1]
+# q1 = stroke_xy[1:]
 
-    # middle point
-    # m = np.float32(0.5) * (Qi[:, None, :] + Qj[None, :, :])
+# middle point
+# m = np.float32(0.5) * (Qi[:, None, :] + Qj[None, :, :])
 
-    # directional vector
-    # d = (Qj[None, :, :] - Qi[:, None, :]).astype(np.float32)
+# directional vector
+# d = (Qj[None, :, :] - Qi[:, None, :]).astype(np.float32)
 
-    # construct v
-    # L = np.linalg.norm(d, axis=2, keepdims=True)
-    # v = np.divide(d, L, out=np.zeros_like(d), where=L > eps)
+# construct v
+# L = np.linalg.norm(d, axis=2, keepdims=True)
+# v = np.divide(d, L, out=np.zeros_like(d), where=L > eps)
 
-    # construct u
-    # u = np.empty_like(v)
-    # u[:, :, 0] = -v[:, :, 1]
-    # u[:, :, 1] = v[:, :, 0]
-    #
-    # X = EdgeSnappingConfig.X_MAX
-    # Y = EdgeSnappingConfig.Y_MAX
-    # t = m - X * u - Y * v
+# construct u
+# u = np.empty_like(v)
+# u[:, :, 0] = -v[:, :, 1]
+# u[:, :, 1] = v[:, :, 0]
+#
+# X = EdgeSnappingConfig.X_MAX
+# Y = EdgeSnappingConfig.Y_MAX
+# t = m - X * u - Y * v
 
-    # construct affine matrix
+# construct affine matrix
 
-    #                             stack along new axis = 3
-    #                             ----------------------->
-    # makes [u0, u1], [v0, v1] to [u0 v0]
-    #                             [u1 v1]
-    # A = np.stack([u, v], axis=3)
+#                             stack along new axis = 3
+#                             ----------------------->
+# makes [u0, u1], [v0, v1] to [u0 v0]
+#                             [u1 v1]
+# A = np.stack([u, v], axis=3)
 
-    #                                  concatenate along existed axis = 3
-    #                                  ----------------------->
-    #             [u0 v0]      [m0]    [u0 v0 m0]
-    # concatenate [u1 v1] with [m1] to [u1 v1 m1]
-    # M = np.concatenate([A, t[:, :, :, None]], axis=3)
-    #
-    # # inverse affine matrix
-    # # transpose axis=1 and axis=2
-    # A_T = np.transpose(A, (0, 2, 1))
-    #
-    # # new_p = M @ p + m
-    # # -----> M @ p = new_p - m
-    # # -----> p = inv(M) @ new_p - inv(M) @ m
-    # # let "t_inv" be "- inv(M) @ m"
-    # # -----> p = inv(M) @ new_p + t_inv
-    # t_inv = -(A_T @ m[:, :, None])
-    # M_inv = np.concatenate([A_T, t_inv], axis=2)
+#                                  concatenate along existed axis = 3
+#                                  ----------------------->
+#             [u0 v0]      [m0]    [u0 v0 m0]
+# concatenate [u1 v1] with [m1] to [u1 v1 m1]
+# M = np.concatenate([A, t[:, :, :, None]], axis=3)
+#
+# # inverse affine matrix
+# # transpose axis=1 and axis=2
+# A_T = np.transpose(A, (0, 2, 1))
+#
+# # new_p = M @ p + m
+# # -----> M @ p = new_p - m
+# # -----> p = inv(M) @ new_p - inv(M) @ m
+# # let "t_inv" be "- inv(M) @ m"
+# # -----> p = inv(M) @ new_p + t_inv
+# t_inv = -(A_T @ m[:, :, None])
+# M_inv = np.concatenate([A_T, t_inv], axis=2)
 
-    # return M
+# return M
 
 
 # def batch_wrap_with_affine_and_trim(image_np_gray: np.ndarray, M_affines: np.ndarray):
@@ -277,5 +355,3 @@ def pack_candidates_yx_to_integrity_xy(candidate_points: List[np.ndarray]):
 #         out.append(wrapped)
 #     image_np_affine = np.stack(out, axis=0)
 #     return image_np_affine  # [:, :2 * EdgeSnappingConfig.Y_MAX + 1, :2 * EdgeSnappingConfig.X_MAX + 1]
-
-
