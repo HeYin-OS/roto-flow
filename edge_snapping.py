@@ -1,13 +1,11 @@
-import dataclasses
 from typing import List, Any
-
 import cv2
+
 import numpy as np
 import torch
 from PIL import Image
 from PySide6.QtCore import QPoint
 from torch import Tensor
-
 from yaml_reader import YamlUtil
 
 
@@ -22,6 +20,51 @@ def mm_to_pixels(mm, imgUrl):
     dpi = getDpi(imgUrl)
     pixel_length = dpi[0] * inches
     return pixel_length
+
+
+def create_gaussian_kernel(size, sigma, direction):
+    kernel = cv2.getGaussianKernel(size, sigma, cv2.CV_32F)
+    if direction == 0:
+        return kernel
+    elif direction == 1:
+        return kernel.T
+    return None
+
+
+def create_fdog_kernel(size, sigma_c, sigma_s, rho, direction):
+    kernel1 = create_gaussian_kernel(size, sigma_c, direction)
+    kernel2 = create_gaussian_kernel(size, sigma_s, direction)
+    dog_kernel = kernel1 - rho * kernel2
+    return dog_kernel
+
+def compute_candidates(frames_tensor_rgb: Tensor):
+    out = []
+    for i, frame_tensor_rgb in enumerate(frames_tensor_rgb):
+        image_np_rgb = (frame_tensor_rgb.permute(1, 2, 0).data.cpu().numpy() * 255).astype(np.uint8)
+        image_np_gray = cv2.cvtColor(image_np_rgb, cv2.COLOR_RGB2GRAY)
+
+        # gradient magnitude
+        gx = cv2.Sobel(image_np_gray, cv2.CV_32F, 1, 0, ksize=3, borderType=cv2.BORDER_DEFAULT)
+        gy = cv2.Sobel(image_np_gray, cv2.CV_32F, 0, 1, ksize=3, borderType=cv2.BORDER_DEFAULT)
+        mag = cv2.magnitude(gx, gy)
+
+        # normalization
+        mag_norm = cv2.normalize(mag, None, 0, 1, cv2.NORM_MINMAX, dtype=cv2.CV_32F)
+
+        # neighbor max in 3*3 window
+        k = np.ones((3, 3), np.uint8)
+        k[1, 1] = 0
+        nbr_max = cv2.dilate(mag_norm, k)
+
+        # local maximum
+        local_max = (mag_norm > nbr_max) & (mag_norm >= float(EdgeSnappingConfig.theta))
+
+        # if i == 0: cv2.imshow('local_max', local_max.astype(np.uint8) * 255)
+
+        # all candidate points on this frame
+        ys, xs = np.nonzero(local_max)
+        out.append(np.stack([ys, xs], axis=1))
+    return out
 
 
 class EdgeSnappingConfig:
@@ -80,7 +123,6 @@ class EdgeSnappingConfig:
         )
 
 
-# image [C, H, W]
 def local_snapping(stroke_np_yx: np.ndarray, image_tensor_rgb: Tensor, stroke_point_idx_to_candidates: List[np.ndarray]):
     image_np_rgb = (image_tensor_rgb.permute(1, 2, 0).data.cpu().numpy() * 255).astype(np.uint8)
     image_np_gray = cv2.cvtColor(image_np_rgb, cv2.COLOR_RGB2GRAY)
@@ -88,36 +130,6 @@ def local_snapping(stroke_np_yx: np.ndarray, image_tensor_rgb: Tensor, stroke_po
     compute_weights(stroke_np_yx, image_np_gray, stroke_point_idx_to_candidates)
 
     # TODO: complete weight computation
-
-
-def compute_candidates(frames_tensor_rgb: Tensor):
-    out = []
-    for i, frame_tensor_rgb in enumerate(frames_tensor_rgb):
-        image_np_rgb = (frame_tensor_rgb.permute(1, 2, 0).data.cpu().numpy() * 255).astype(np.uint8)
-        image_np_gray = cv2.cvtColor(image_np_rgb, cv2.COLOR_RGB2GRAY)
-
-        # gradient magnitude
-        gx = cv2.Sobel(image_np_gray, cv2.CV_32F, 1, 0, ksize=3, borderType=cv2.BORDER_DEFAULT)
-        gy = cv2.Sobel(image_np_gray, cv2.CV_32F, 0, 1, ksize=3, borderType=cv2.BORDER_DEFAULT)
-        mag = cv2.magnitude(gx, gy)
-
-        # normalization
-        mag_norm = cv2.normalize(mag, None, 0, 1, cv2.NORM_MINMAX, dtype=cv2.CV_32F)
-
-        # neighbor max in 3*3 window
-        k = np.ones((3, 3), np.uint8)
-        k[1, 1] = 0
-        nbr_max = cv2.dilate(mag_norm, k)
-
-        # local maximum
-        local_max = (mag_norm > nbr_max) & (mag_norm >= float(EdgeSnappingConfig.theta))
-
-        # if i == 0: cv2.imshow('local_max', local_max.astype(np.uint8) * 255)
-
-        # all candidate points on this frame
-        ys, xs = np.nonzero(local_max)
-        out.append(np.stack([ys, xs], axis=1))
-    return out
 
 
 def compute_weights(stroke_np_yx: np.ndarray,
@@ -196,28 +208,28 @@ def pack_candidates_yx_to_integrity_xy(candidate_points: List[np.ndarray]):
     return candidates_flatten_xy, index_ptr
 
 
-def batch_affine(Qi: np.ndarray, Qj: np.ndarray, eps: np.float32 = 1e-6):
+# def batch_affine(Qi: np.ndarray, Qj: np.ndarray, eps: np.float32 = 1e-6):
     # q0 = stroke_xy[:-1]
     # q1 = stroke_xy[1:]
 
     # middle point
-    m = np.float32(0.5) * (Qi[:, None, :] + Qj[None, :, :])
+    # m = np.float32(0.5) * (Qi[:, None, :] + Qj[None, :, :])
 
     # directional vector
-    d = (Qj[None, :, :] - Qi[:, None, :]).astype(np.float32)
+    # d = (Qj[None, :, :] - Qi[:, None, :]).astype(np.float32)
 
     # construct v
-    L = np.linalg.norm(d, axis=2, keepdims=True)
-    v = np.divide(d, L, out=np.zeros_like(d), where=L > eps)
+    # L = np.linalg.norm(d, axis=2, keepdims=True)
+    # v = np.divide(d, L, out=np.zeros_like(d), where=L > eps)
 
     # construct u
-    u = np.empty_like(v)
-    u[:, :, 0] = -v[:, :, 1]
-    u[:, :, 1] = v[:, :, 0]
-
-    X = EdgeSnappingConfig.X_MAX
-    Y = EdgeSnappingConfig.Y_MAX
-    t = m - X * u - Y * v
+    # u = np.empty_like(v)
+    # u[:, :, 0] = -v[:, :, 1]
+    # u[:, :, 1] = v[:, :, 0]
+    #
+    # X = EdgeSnappingConfig.X_MAX
+    # Y = EdgeSnappingConfig.Y_MAX
+    # t = m - X * u - Y * v
 
     # construct affine matrix
 
@@ -225,13 +237,13 @@ def batch_affine(Qi: np.ndarray, Qj: np.ndarray, eps: np.float32 = 1e-6):
     #                             ----------------------->
     # makes [u0, u1], [v0, v1] to [u0 v0]
     #                             [u1 v1]
-    A = np.stack([u, v], axis=3)
+    # A = np.stack([u, v], axis=3)
 
     #                                  concatenate along existed axis = 3
     #                                  ----------------------->
     #             [u0 v0]      [m0]    [u0 v0 m0]
     # concatenate [u1 v1] with [m1] to [u1 v1 m1]
-    M = np.concatenate([A, t[:, :, :, None]], axis=3)
+    # M = np.concatenate([A, t[:, :, :, None]], axis=3)
     #
     # # inverse affine matrix
     # # transpose axis=1 and axis=2
@@ -245,39 +257,25 @@ def batch_affine(Qi: np.ndarray, Qj: np.ndarray, eps: np.float32 = 1e-6):
     # t_inv = -(A_T @ m[:, :, None])
     # M_inv = np.concatenate([A_T, t_inv], axis=2)
 
-    return M
+    # return M
 
 
-def batch_wrap_with_affine_and_trim(image_np_gray: np.ndarray, M_affines: np.ndarray):
-    M_affines = M_affines.astype(np.float32)
-    Hwin, Wwin = 2 * EdgeSnappingConfig.Y_MAX + 1, 2 * EdgeSnappingConfig.X_MAX + 1
-
-    out = []
-    for i in range(M_affines.shape[0]):
-        wrapped = cv2.warpAffine(
-            image_np_gray,
-            M_affines[i],
-            dsize=(Wwin, Hwin),
-            flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0
-        )
-        out.append(wrapped)
-    image_np_affine = np.stack(out, axis=0)
-    return image_np_affine  # [:, :2 * EdgeSnappingConfig.Y_MAX + 1, :2 * EdgeSnappingConfig.X_MAX + 1]
-
-
-def create_gaussian_kernel(size, sigma, direction):
-    kernel = cv2.getGaussianKernel(size, sigma, cv2.CV_32F)
-    if direction == 0:
-        return kernel
-    elif direction == 1:
-        return kernel.T
-    return None
+# def batch_wrap_with_affine_and_trim(image_np_gray: np.ndarray, M_affines: np.ndarray):
+#     M_affines = M_affines.astype(np.float32)
+#     Hwin, Wwin = 2 * EdgeSnappingConfig.Y_MAX + 1, 2 * EdgeSnappingConfig.X_MAX + 1
+#
+#     out = []
+#     for i in range(M_affines.shape[0]):
+#         wrapped = cv2.warpAffine(
+#             image_np_gray,
+#             M_affines[i],
+#             dsize=(Wwin, Hwin),
+#             flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+#             borderMode=cv2.BORDER_CONSTANT,
+#             borderValue=0
+#         )
+#         out.append(wrapped)
+#     image_np_affine = np.stack(out, axis=0)
+#     return image_np_affine  # [:, :2 * EdgeSnappingConfig.Y_MAX + 1, :2 * EdgeSnappingConfig.X_MAX + 1]
 
 
-def create_fdog_kernel(size, sigma_c, sigma_s, rho, direction):
-    kernel1 = create_gaussian_kernel(size, sigma_c, direction)
-    kernel2 = create_gaussian_kernel(size, sigma_s, direction)
-    dog_kernel = kernel1 - rho * kernel2
-    return dog_kernel
