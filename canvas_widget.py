@@ -116,7 +116,7 @@ class CanvasWidget(QWidget):
         )
         local_snapping(stroke_np_yx=current_stroke_np_yx,
                        image_tensor_rgb=self.test_video.tensor_format[self.index_current_frame],
-                       stroke_point_idx_to_candidates=stroke_point_idx_to_candidates)
+                       candidate_points=stroke_point_idx_to_candidates)
         # test_image = np.zeros_like(cv2.imread("videos/soapbox/00000.jpg", flags=cv2.IMREAD_GRAYSCALE), dtype=np.uint8)
         # for candidate_group in stroke_point_idx_to_candidates:
         #     for (y, x) in candidate_group:

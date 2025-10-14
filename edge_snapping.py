@@ -124,33 +124,14 @@ class EdgeSnappingConfig:
         )
 
 
-def local_snapping(stroke_np_yx: np.ndarray, image_tensor_rgb: Tensor, stroke_point_idx_to_candidates: List[np.ndarray]):
-    image_np_rgb = (image_tensor_rgb.permute(1, 2, 0).data.cpu().numpy() * 255).astype(np.uint8)
-    image_np_gray = cv2.cvtColor(image_np_rgb, cv2.COLOR_RGB2GRAY)
-
-    compute_weights(stroke_np_yx, image_np_gray, stroke_point_idx_to_candidates)
-
-    # TODO: complete weight computation
-
-
-def compute_weights(stroke_np_yx: np.ndarray,
-                    image_np_gray: np.ndarray,
-                    candidate_points: List[np.ndarray]):
+def local_snapping(stroke_np_yx: np.ndarray, image_tensor_rgb: Tensor, candidate_points: List[np.ndarray]):
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     torch.backends.cudnn.benchmark = True
 
     # convert np gray image [H, W] to tensor [B=1, C=1, H, W]
-    H = image_np_gray.shape[0]
-    W = image_np_gray.shape[1]
-    image_np_gray = image_np_gray.astype(np.float32) / 255.0
-    image_tensor_gray_gpu = (
-        torch.from_numpy(image_np_gray)
-        .unsqueeze(0).unsqueeze(0)
-        .to(device, non_blocking=True)
-        .contiguous()
-    )   # shape: [1, 1, H, W]
-
-    print(image_tensor_gray_gpu.shape)
+    H = image_tensor_rgb.shape[0]
+    W = image_tensor_rgb.shape[1]
+    image_tensor_gray_gpu = rgb_np_to_gray_tensor(device, image_tensor_rgb)
 
     # convert jagged array to flatten array with index pointer page
     candidates_flatten_xy, flatten_index_ptr = pack_candidates_yx_to_integrity_xy(candidate_points)
@@ -171,41 +152,105 @@ def compute_weights(stroke_np_yx: np.ndarray,
 
     for i in range(stroke_len - 1):
         # candidate point groups of current stroke point index
-        Ui = slice(flatten_index_ptr[i], flatten_index_ptr[i + 1])
-        Uj = slice(flatten_index_ptr[i + 1], flatten_index_ptr[i + 2])
-        Qi_xy = candidates_flatten_xy[Ui]
-        Qj_xy = candidates_flatten_xy[Uj]
+        Qi_xy, Qj_xy = slice_candidates_by_index(candidates_flatten_xy, flatten_index_ptr, i)
+
+        # print(f"Qi_xy: {Qi_xy.shape[0]} * Qj_xy: {Qj_xy.shape[0]} = {Qi_xy.shape[0] * Qj_xy.shape[0]}")
 
         p_i, p_j = stroke_xy[i], stroke_xy[i + 1]
+        weights = compute_weights(H, W,
+                                  p_i, p_j,
+                                  Qi_xy, Qj_xy,
+                                  device,
+                                  image_tensor_gray_gpu)
 
-        theta_flatten_gpu = batch_neighbor_candidates_to_reverse_affine(Qi_xy,
-                                                                        Qi_xy,
-                                                                        H, W).to(device)  # shape: [K_{i} * K_{i+1}, 2, 3]
+        # TODO: use weights to do dp
 
-        grid_gpu = torch.nn.functional.affine_grid(
-            theta_flatten_gpu,
-            size=[theta_flatten_gpu.shape[0],
-                  1,
-                  2 * EdgeSnappingConfig.Y_MAX + 1,
-                  2 * EdgeSnappingConfig.X_MAX + 1],
-            align_corners=False
-        ).to(device)  # shape: [K_{i} * K_{i+1}, 2*Y+1, 2*X+1, 2]
 
-        image_affine_and_trimmed = torch.nn.functional.grid_sample(image_tensor_gray_gpu.expand(grid_gpu.shape[0], -1, -1, -1),
-                                                                   grid_gpu,
-                                                                   mode='bilinear',
-                                                                   padding_mode='zeros',
-                                                                   align_corners=False).to(device)
+def compute_weights(H: int, W: int,
+                    p_i: np.ndarray, p_j: np.ndarray,
+                    Qi_xy, Qj_xy,
+                    device,
+                    image_tensor_gray_gpu: Tensor):
+    theta_flatten_gpu = batch_neighbor_candidates_to_reverse_affine(Qi_xy,
+                                                                    Qj_xy,
+                                                                    H, W).to(device)  # shape: [K_{i} * K_{i+1}, 2, 3]
 
-        # TODO: compute weights based on trimmed image and do integral
+    grid_gpu = torch.nn.functional.affine_grid(
+        theta_flatten_gpu,
+        size=[theta_flatten_gpu.shape[0],
+              1,
+              2 * EdgeSnappingConfig.Y_MAX + 1,
+              2 * EdgeSnappingConfig.X_MAX + 1],
+        align_corners=False
+    ).to(device)  # shape: [K_{i} * K_{i+1}, 2*Y+1, 2*X+1, 2]
 
-    # temp = np.tensordot(image_np_trimmed,
-    #                     EdgeSnappingConfig.fdog_kernel,
-    #                     axes=([-1], [-1]))
-    # H = np.tensordot(temp,
-    #                  EdgeSnappingConfig.gaussian_kernel,
-    #                  axes=([1], [0])).squeeze()
-    # tilde_H = np.where(H < 0, 1.0 + np.tanh(H), 1.0)
+    image_affine_and_trimmed = (torch.nn.functional.grid_sample(image_tensor_gray_gpu.expand(grid_gpu.shape[0], -1, -1, -1),
+                                                                grid_gpu,
+                                                                mode='bilinear',
+                                                                padding_mode='zeros',
+                                                                align_corners=False)
+                                .squeeze(1)  # eliminate dim=1 since len=1 (gray channel)
+                                .reshape(Qi_xy.shape[0],
+                                         Qj_xy.shape[0],
+                                         2 * EdgeSnappingConfig.Y_MAX + 1,
+                                         2 * EdgeSnappingConfig.X_MAX + 1)  # return batch size to 2 dims, len of can1 and can2
+                                .cpu().numpy())  # change to nparray such that do tensor dot afterward
+
+    # print(f"theta_flatten_gpu: {theta_flatten_gpu.shape}")
+    # print(f"grid_gpu.shape = {grid_gpu.shape}")
+    # print(f"image_affine_and_trimmed: {image_affine_and_trimmed.shape}")
+    # print(f"fdog.shape: {EdgeSnappingConfig.fdog_kernel.shape}")
+    # print(f"gaus.shape: {EdgeSnappingConfig.gaussian_kernel.shape}")
+
+    res_dot_on_x = np.tensordot(image_affine_and_trimmed,
+                                EdgeSnappingConfig.fdog_kernel.squeeze(),
+                                axes=([-1], [0]))
+
+    res_dot_on_x_y = np.tensordot(res_dot_on_x,
+                                  EdgeSnappingConfig.gaussian_kernel.squeeze(),
+                                  axes=([-1], [0])).squeeze()
+
+    tilde_H_response = np.where(res_dot_on_x_y < 0, 1.0 + np.tanh(res_dot_on_x_y), 1.0)
+
+    # print(f"temp.shape = {res_dot_on_x.shape}, res_dot_on_x_y.shape = {res_dot_on_x_y.shape}, tilde_H.shape = {tilde_H_response.shape}")
+
+    p_diff = (p_j - p_i).astype(np.float32)
+    q_diff = Qi_xy.astype(np.float32)[:, None, :] - Qj_xy.astype(np.float32)[None, :, :]
+    diff = p_diff.reshape(1, 1, 2) - q_diff
+    square_norm = np.sum(diff * diff, axis=-1)
+    r_s_square = float(EdgeSnappingConfig.r_s) ** 2
+
+    weights = (square_norm / r_s_square) + EdgeSnappingConfig.alpha * tilde_H_response
+
+    # print(f"p_diff.shape = {p_diff.shape}")
+    # print(f"q_diff.shape = {q_diff.shape}")
+    # print(f"diff.shape = {diff.shape}")
+    # print(f"square_norm.shape = {square_norm.shape}")
+    # print(f"weights.shape = {weights.shape}")
+
+    return weights
+
+
+def slice_candidates_by_index(candidates_flatten_xy: np.ndarray, flatten_index_ptr: np.ndarray, i: int) \
+        -> tuple[np.ndarray, np.ndarray]:
+    Ui = slice(flatten_index_ptr[i], flatten_index_ptr[i + 1])
+    Uj = slice(flatten_index_ptr[i + 1], flatten_index_ptr[i + 2])
+    Qi_xy = candidates_flatten_xy[Ui]
+    Qj_xy = candidates_flatten_xy[Uj]
+    return Qi_xy, Qj_xy
+
+
+def rgb_np_to_gray_tensor(device, image_tensor_rgb: Tensor) -> Tensor:
+    image_np_rgb = (image_tensor_rgb.permute(1, 2, 0).data.cpu().numpy() * 255).astype(np.uint8)
+    image_np_gray = cv2.cvtColor(image_np_rgb, cv2.COLOR_RGB2GRAY)
+    image_np_gray = image_np_gray.astype(np.float32) / 255.0
+    image_tensor_gray_gpu = (
+        torch.from_numpy(image_np_gray)
+        .unsqueeze(0).unsqueeze(0)
+        .to(device, non_blocking=True)
+        .contiguous()
+    )  # shape: [1, 1, H, W]
+    return image_tensor_gray_gpu
 
 
 # make jagged array to a integrated long array with index range pointer page
@@ -245,8 +290,11 @@ def batch_neighbor_candidates_to_reverse_affine(Qi: np.ndarray,
     Qi = torch.from_numpy(Qi.copy().astype(np.float32)).to(device)
     Qj = torch.from_numpy(Qj.copy().astype(np.float32)).to(device)
 
-    len_i = Qj.shape[0]
-    len_j = Qi.shape[0]
+    # print(f"new Qi: {Qi.shape}")
+    # print(f"new Qj: {Qj.shape}")
+
+    len_i = Qi.shape[0]
+    len_j = Qj.shape[0]
 
     m = 0.5 * (Qi[:, None, :] + Qj[None, :, :])  # [len_i, len_j, 2]
     d = (Qj[None, :, :] - Qi[:, None, :])  # [len_i, len_j, 2]
@@ -256,6 +304,12 @@ def batch_neighbor_candidates_to_reverse_affine(Qi: np.ndarray,
     u = torch.empty_like(v)  # [len_i, len_j, 2]
     u[..., 0] = -v[..., 1]
     u[..., 1] = v[..., 0]
+
+    # print(f"m.shape: {m.shape}")
+    # print(f"d.shape: {d.shape}")
+    # print(f"L.shape: {L.shape}")
+    # print(f"u.shape: {u.shape}")
+    # print(f"v.shape: {v.shape}")
 
     X = float(EdgeSnappingConfig.X_MAX)
     Y = float(EdgeSnappingConfig.Y_MAX)
@@ -269,12 +323,23 @@ def batch_neighbor_candidates_to_reverse_affine(Qi: np.ndarray,
     # image coordinates to NDC
     #                       [a00, a01, t0]
     # target affine matrix: [a10, a11, t1] in NDC (for pytorch grid sampling)
+
+    # print(type(sy))
+    # print(sy)
+
     a00 = sx * (X * u[..., 0])
     a01 = sx * (Y * v[..., 0])
     a10 = sy * (X * u[..., 1])
     a11 = sy * (Y * v[..., 1])
     t0 = sx * m[..., 0] + bx
     t1 = sy * m[..., 1] + by
+
+    # print(f"a00.shape: {a00.shape}")
+    # print(f"a01.shape: {a01.shape}")
+    # print(f"a10.shape: {a10.shape}")
+    # print(f"a11.shape: {a11.shape}")
+    # print(f"t0.shape: {t0.shape}")
+    # print(f"t1.shape: {t1.shape}")
 
     # build affine matrix - theta
     theta = torch.stack([
@@ -284,74 +349,7 @@ def batch_neighbor_candidates_to_reverse_affine(Qi: np.ndarray,
 
     theta_flat = theta.reshape(len_i * len_j, 2, 3).contiguous()  # [len_i * len_j, 2, 3]
 
+    # print(f"theta.shape: {theta.shape}")
+    # print(f"theta_flat.shape: {theta_flat.shape}")
+
     return theta_flat
-
-# def batch_affine(Qi: np.ndarray, Qj: np.ndarray, eps: np.float32 = 1e-6):
-# q0 = stroke_xy[:-1]
-# q1 = stroke_xy[1:]
-
-# middle point
-# m = np.float32(0.5) * (Qi[:, None, :] + Qj[None, :, :])
-
-# directional vector
-# d = (Qj[None, :, :] - Qi[:, None, :]).astype(np.float32)
-
-# construct v
-# L = np.linalg.norm(d, axis=2, keepdims=True)
-# v = np.divide(d, L, out=np.zeros_like(d), where=L > eps)
-
-# construct u
-# u = np.empty_like(v)
-# u[:, :, 0] = -v[:, :, 1]
-# u[:, :, 1] = v[:, :, 0]
-#
-# X = EdgeSnappingConfig.X_MAX
-# Y = EdgeSnappingConfig.Y_MAX
-# t = m - X * u - Y * v
-
-# construct affine matrix
-
-#                             stack along new axis = 3
-#                             ----------------------->
-# makes [u0, u1], [v0, v1] to [u0 v0]
-#                             [u1 v1]
-# A = np.stack([u, v], axis=3)
-
-#                                  concatenate along existed axis = 3
-#                                  ----------------------->
-#             [u0 v0]      [m0]    [u0 v0 m0]
-# concatenate [u1 v1] with [m1] to [u1 v1 m1]
-# M = np.concatenate([A, t[:, :, :, None]], axis=3)
-#
-# # inverse affine matrix
-# # transpose axis=1 and axis=2
-# A_T = np.transpose(A, (0, 2, 1))
-#
-# # new_p = M @ p + m
-# # -----> M @ p = new_p - m
-# # -----> p = inv(M) @ new_p - inv(M) @ m
-# # let "t_inv" be "- inv(M) @ m"
-# # -----> p = inv(M) @ new_p + t_inv
-# t_inv = -(A_T @ m[:, :, None])
-# M_inv = np.concatenate([A_T, t_inv], axis=2)
-
-# return M
-
-
-# def batch_wrap_with_affine_and_trim(image_np_gray: np.ndarray, M_affines: np.ndarray):
-#     M_affines = M_affines.astype(np.float32)
-#     Hwin, Wwin = 2 * EdgeSnappingConfig.Y_MAX + 1, 2 * EdgeSnappingConfig.X_MAX + 1
-#
-#     out = []
-#     for i in range(M_affines.shape[0]):
-#         wrapped = cv2.warpAffine(
-#             image_np_gray,
-#             M_affines[i],
-#             dsize=(Wwin, Hwin),
-#             flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
-#             borderMode=cv2.BORDER_CONSTANT,
-#             borderValue=0
-#         )
-#         out.append(wrapped)
-#     image_np_affine = np.stack(out, axis=0)
-#     return image_np_affine  # [:, :2 * EdgeSnappingConfig.Y_MAX + 1, :2 * EdgeSnappingConfig.X_MAX + 1]
