@@ -1,10 +1,12 @@
 from typing import List, Any
 import cv2
+import numba
 
 import numpy as np
 import torch
 from PIL import Image
 from PySide6.QtCore import QPoint
+from numpy import ndarray
 from torch import Tensor
 from yaml_reader import YamlUtil
 
@@ -124,7 +126,9 @@ class EdgeSnappingConfig:
         )
 
 
-def local_snapping(stroke_np_yx: np.ndarray, image_tensor_rgb: Tensor, candidate_points: List[np.ndarray]):
+def local_snapping(stroke_np_yx: np.ndarray,
+                   image_tensor_rgb: Tensor,
+                   candidate_points_yx: List[np.ndarray]):
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     torch.backends.cudnn.benchmark = True
 
@@ -134,7 +138,7 @@ def local_snapping(stroke_np_yx: np.ndarray, image_tensor_rgb: Tensor, candidate
     image_tensor_gray_gpu = rgb_np_to_gray_tensor(device, image_tensor_rgb)
 
     # convert jagged array to flatten array with index pointer page
-    candidates_flatten_xy, flatten_index_ptr = pack_candidates_yx_to_integrity_xy(candidate_points)
+    candidates_flatten_xy, flatten_index_ptr = pack_candidates_yx_to_integrity_xy(candidate_points_yx)
     candidate_len = flatten_index_ptr[-1]
 
     # order to xy and get point number of stroke
@@ -145,7 +149,7 @@ def local_snapping(stroke_np_yx: np.ndarray, image_tensor_rgb: Tensor, candidate
     # energy -> accumulated energy for each candidate point
     # prev -> the best previous candidate point idx
     energy = np.full(candidate_len, np.inf, dtype=np.float32)
-    prev = np.full(candidate_len, -1, dtype=np.float32)
+    prev = np.full(candidate_len, -1, dtype=np.int32)
 
     # accumulated energy for first candidate group is zero
     energy[flatten_index_ptr[0]: flatten_index_ptr[1]] = 0.0
@@ -156,14 +160,51 @@ def local_snapping(stroke_np_yx: np.ndarray, image_tensor_rgb: Tensor, candidate
 
         # print(f"Qi_xy: {Qi_xy.shape[0]} * Qj_xy: {Qj_xy.shape[0]} = {Qi_xy.shape[0] * Qj_xy.shape[0]}")
 
+        # weights between each two points in two groups
         p_i, p_j = stroke_xy[i], stroke_xy[i + 1]
         weights = compute_weights(H, W,
                                   p_i, p_j,
                                   Qi_xy, Qj_xy,
                                   device,
-                                  image_tensor_gray_gpu)
+                                  image_tensor_gray_gpu)  # shape: [K_i, K_j]
 
-        # TODO: use weights to do dp
+        # print(f"weights.shape: {weights.shape} ")
+
+        dp_energy_iteration(i, flatten_index_ptr, energy, prev, weights)
+
+    last_start, last_end = flatten_index_ptr[-2], flatten_index_ptr[-1]
+    best_idx = np.argmin(energy[last_start:last_end]) + last_start
+
+    # TODO: add checks of two conditions based on the paper
+
+    best_path_indices = []
+    while best_idx != -1:
+        best_path_indices.insert(0, best_idx)
+        best_idx = prev[best_idx]
+
+    return candidates_flatten_xy[best_path_indices]
+
+@numba.njit
+def dp_energy_iteration(i: int, flatten_index_ptr: np.ndarray,
+                        energy: np.ndarray,
+                        prev: np.ndarray,
+                        weights: np.ndarray):
+    start_i, end_i = flatten_index_ptr[i], flatten_index_ptr[i + 1]
+    start_j, end_j = flatten_index_ptr[i + 1], flatten_index_ptr[i + 2]
+
+    for idx_j in range(end_j - start_j):
+        best_prev = -1
+        best_energy = np.inf
+
+        for idx_i in range(end_i - start_i):
+            bi_energy = energy[start_i + idx_i] + weights[idx_i, idx_j]
+
+            if bi_energy < best_energy:
+                best_prev = start_i + idx_i
+                best_energy = bi_energy
+
+        energy[start_j + idx_j] = best_energy
+        prev[start_j + idx_j] = best_prev
 
 
 def compute_weights(H: int, W: int,

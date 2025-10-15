@@ -22,7 +22,7 @@ class CanvasWidget(QWidget):
         self.is_mouse_pressed: bool = False
 
         # factors for controlling mouse sampling length
-        self.min_manhattan = 3
+        self.min_manhattan: int = 3
 
         # indicator for current frame index
         self.index_current_frame: int = 0
@@ -36,6 +36,8 @@ class CanvasWidget(QWidget):
         # storage for curves (Div1: frame idx<list>, Div2: drawing idx<list>, Div3: point idx<list>, Div4: QPoint)
         self.curves_on_each_frame: List[List[List[QPoint]]] = [[] for _ in range(self.test_video.frame_num)]
         self.curve_temp: List[QPoint] = []
+
+        self.weights_history: List[np.ndarray] = []
 
         # TODO: Other variables for future implementation of bezier curve
 
@@ -109,14 +111,21 @@ class CanvasWidget(QWidget):
         # TODO: edge snapping curve here
         # only current curve needs to be done local snapping
         current_stroke_np_yx = np.array([[p.y(), p.x()] for p in self.curve_temp], dtype=np.float32)
-        stroke_point_idx_to_candidates = self.test_video.candidate_kd_trees.query_batch(
+        candidates_yx = self.test_video.candidate_kd_trees.query_batch(
             frame_idx=self.index_current_frame,
             centers_yx=current_stroke_np_yx,
             radius=EdgeSnappingConfig.r_s
         )
-        local_snapping(stroke_np_yx=current_stroke_np_yx,
+
+        # get snapped stroke in np xy form
+        local_snapped_stroke_np_xy = local_snapping(stroke_np_yx=current_stroke_np_yx,
                        image_tensor_rgb=self.test_video.tensor_format[self.index_current_frame],
-                       candidate_points=stroke_point_idx_to_candidates)
+                       candidate_points_yx=candidates_yx)
+
+        # convert it to List [QPoint]
+        # print(local_snapped_stroke_np_xy.shape)
+        fitted_stroke_xy = [QPoint(int(xy[0]), int(xy[1])) for xy in local_snapped_stroke_np_xy]
+
         # test_image = np.zeros_like(cv2.imread("videos/soapbox/00000.jpg", flags=cv2.IMREAD_GRAYSCALE), dtype=np.uint8)
         # for candidate_group in stroke_point_idx_to_candidates:
         #     for (y, x) in candidate_group:
@@ -124,7 +133,7 @@ class CanvasWidget(QWidget):
         # cv2.imshow("test_image", test_image)
 
         # move temp curve to curves
-        self.curves_on_each_frame[self.index_current_frame].append(self.curve_temp)
+        self.curves_on_each_frame[self.index_current_frame].append(fitted_stroke_xy)
         self.curve_temp = []
         # debug
         print(f"[Sketch] {len(self.curves_on_each_frame[self.index_current_frame])} curve(s) on Frame {self.index_current_frame}")
